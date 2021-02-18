@@ -70,6 +70,36 @@ class LLVM_LIBRARY_VISIBILITY X86AsmPrinter : public AsmPrinter {
     unsigned RequiredShadowSize = 0, CurrentShadowSize = 0;
   };
 
+  class InstCounter {
+  public:
+    InstCounter (TargetMachine &TM) : TM(TM), codeSize(0), CodeEmitter(NULL) {}
+    ~InstCounter () {}
+    void count(MCInst &Inst, const MCSubtargetInfo &STI);
+    unsigned getLastInstrSize() { return instSize; }
+    unsigned getCodeSize() { return codeSize; }
+    void setCodeSize(unsigned size) { codeSize = size; }
+    void free() { delete CodeEmitter; }
+    void setForNewFunction(MachineFunction &F);
+  private:
+    MachineFunction *MF;
+    TargetMachine &TM;
+    MCCodeEmitter *CodeEmitter;
+    unsigned instSize;
+    unsigned codeSize;
+  };
+  
+  // Jaebaek: to handle bundled instructions
+  bool isBundled;
+  bool flushBundle;
+  unsigned bundleSize;
+  bool bundleCall;
+  SmallVector<MCInst, 8> bundledInst;
+
+  InstCounter IC;
+  unsigned units;
+  bool isUncondBranch;
+
+
   StackMapShadowTracker SMShadowTracker;
 
   // All instructions emitted by the X86AsmPrinter should use this helper
@@ -78,6 +108,7 @@ class LLVM_LIBRARY_VISIBILITY X86AsmPrinter : public AsmPrinter {
   // This helper function invokes the SMShadowTracker on each instruction before
   // outputting it to the OutStream. This allows the shadow tracker to minimise
   // the number of NOPs used for stackmap padding.
+  void EmitAndAlignInstruction(MCInst &Inst);
   void EmitAndCountInstruction(MCInst &Inst);
   void LowerSTACKMAP(const MachineInstr &MI);
   void LowerPATCHPOINT(const MachineInstr &MI, X86MCInstLower &MCIL);
@@ -149,6 +180,9 @@ public:
   void emitFunctionBodyStart() override;
   void emitFunctionBodyEnd() override;
 };
+
+const unsigned SFIDEPAlignmentUnit = 32;
+const unsigned jmpInstBytes = 5;
 
 } // end namespace llvm
 

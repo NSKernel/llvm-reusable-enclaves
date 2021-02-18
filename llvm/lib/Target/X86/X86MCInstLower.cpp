@@ -122,6 +122,75 @@ void X86AsmPrinter::StackMapShadowTracker::emitShadowPadding(
   }
 }
 
+void X86AsmPrinter::EmitAndAlignInstruction(MCInst &Inst) {
+  if (MF->hasInlineAsm()) {
+    // If the current machine function has inline assembly,
+    // we will give it a pass
+    EmitAndCountInstruction(Inst);
+    return;
+  }
+
+  // Avoid 8-bit PC-Relative jump
+  if (Inst.getOpcode() == X86::JMP_1)
+    Inst.setOpcode(X86::JMP_4);
+  
+  // Count the current instruction
+  IC.count(Inst, getSubtargetInfo());
+  unsigned isz = IC.getLastInstrSize();
+
+  // If in bundle, we add the instruction size to the bundle then return
+  // We should not break the bundle so it should be treated as one "instruction"
+  if (isBundled) {
+    bundleSize += isz;
+    bundledInst.push_back(Inst);
+    return;
+  }
+
+  // If current unit is reaching the alignment unit, we will enforce the current 
+  // instruction to be aligned in the next unit
+  if (IC.getCodeSize() > (SFIDEPAlignmentUnit - jmpInstBytes)) {
+    /*
+    // emit jmp
+    Twine tmp = MF->getName() + "." + Twine(units++);
+    MCSymbol *Sym = OutContext.getOrCreateSymbol(tmp);
+
+    // Jaebaek: We don't need to add another uncondBr at the 32-bytes boundary.
+    if (isUncondBranch)
+      EmitAndCountInstruction(Inst);
+    else
+      EmitAndCountInstruction(MCInstBuilder(X86::JMP_4)
+          .addExpr(MCSymbolRefExpr::create(Sym,
+              MCSymbolRefExpr::VK_None, OutContext)));
+    */
+
+    // We do not emit jump because we don't need ASLR. We just make sure that everything
+    // is aligned
+    // emit align
+    OutStreamer->emitCodeAlignment(SFIDEPAlignmentUnit);
+
+    /*
+    // emit label
+    OutStreamer->EmitLabel(Sym);
+    */
+
+    // Jaebaek: We don't need to add another uncondBr at the 32-bytes boundary.
+    //if (isUncondBranch)
+    //  IC.setCodeSize(0);
+    //else {
+
+    // The next unit
+    IC.setCodeSize(isz);
+    EmitAndCountInstruction(Inst);
+
+    //}
+    
+    return;
+  }
+  
+  // Elsewise just directly emit
+  EmitAndCountInstruction(Inst);
+}
+
 void X86AsmPrinter::EmitAndCountInstruction(MCInst &Inst) {
   OutStreamer->emitInstruction(Inst, getSubtargetInfo());
   SMShadowTracker.count(Inst, getSubtargetInfo(), CodeEmitter.get());
@@ -2364,10 +2433,93 @@ static void addConstantComments(const MachineInstr *MI,
   }
 }
 
+#define CASE(type) \
+  case X86::J##type##_1: return X86::J##type##_4
+static unsigned getLongCondBr(unsigned opc)
+{
+  switch (opc) {
+    CASE(O); CASE(NO); CASE(B);
+    CASE(AE); CASE(E); CASE(NE);
+    CASE(BE); CASE(A); CASE(S);
+    CASE(NS); CASE(P); CASE(NP);
+    CASE(L); CASE(GE); CASE(LE);
+    CASE(G);
+    case X86::JECXZ: return X86::JECXZ;
+    case X86::JRCXZ: return X86::JRCXZ;
+    default: assert(!"It is not Cond Br");
+  }
+  // unreached
+  return 0;
+ }
+
 void X86AsmPrinter::emitInstruction(const MachineInstr *MI) {
   X86MCInstLower MCInstLowering(*MF, *this);
   const X86RegisterInfo *RI =
       MF->getSubtarget<X86Subtarget>().getRegisterInfo();
+
+  /*
+   * Emit bundle
+   */
+  if (!MF->hasInlineAsm()) {
+    assert(!MI->isIndirectBranch() && "Jaebaek there exists indirect jump!");
+    isUncondBranch = (MI->isReturn() || MI->isUnconditionalBranch() || MI->isIndirectBranch());
+    /* Jaebaek: Soft-DEP & SFI --> handle disappeared bundle instructions */
+    if (MI->isBundle()) {
+      isBundled = true;
+      MachineBasicBlock::const_instr_iterator I = MI->getIterator();
+      MachineBasicBlock::const_instr_iterator E = MI->getParent()->instr_end();
+      while (++I != E && I->isInsideBundle()) {
+        const MachineInstr &tmpI = *I;
+        EmitInstruction(&tmpI);
+      }
+
+      // Instr before the bundle and the bundle exceeds (32 - 5) bytes
+      if (IC.getCodeSize() > SFIDEPAlignmentUnit) {
+        /*
+        // if the last instr of the bundle is uncond br and it is fit for 32 bytes
+        if (IC.getCodeSize() <= maxUnitForASLR && isUncondBranch) {
+          for (unsigned i = 0, e = bundledInst.size(); i != e; ++i)
+            EmitAndCountInstruction(bundledInst[i]);
+          IC.setCodeSize(0);
+        } 
+        else {
+          // emit jmp
+          MCSymbol *Sym = OutContext.getOrCreateSymbol(MF->getName() + "." + Twine(units++));
+          EmitAndCountInstruction(MCInstBuilder(X86::JMP_4)
+              .addExpr(MCSymbolRefExpr::create(Sym,
+                  MCSymbolRefExpr::VK_None, OutContext)));
+
+          // emit align
+          OutStreamer->EmitCodeAlignment(maxUnitForASLR);
+
+          // emit label
+          OutStreamer->EmitLabel(Sym);
+
+          IC.setCodeSize(bundleSize);
+          for (unsigned i = 0, e = bundledInst.size(); i != e; ++i)
+            EmitAndCountInstruction(bundledInst[i]);
+        }
+        */
+
+        // Going to the next unit
+        OutStreamer->EmitCodeAlignment(SFIDEPAlignmentUnit);
+        IC.setCodeSize(bundleSize);
+        // Emit the bundle in the next unit
+        for (unsigned i = 0, e = bundledInst.size(); i != e; ++i) {
+          EmitAndCountInstruction(bundledInst[i]);
+        }
+      } else {
+        // Directly emit the bundle since it fits
+        for (unsigned i = 0, e = bundledInst.size(); i != e; ++i)
+          EmitAndCountInstruction(bundledInst[i]);
+      }
+
+      bundledInst.clear();
+      isBundled = false;
+      bundleSize = 0;
+      return;
+    }
+  }
 
   // Add a comment about EVEX-2-VEX compression for AVX-512 instrs that
   // are compressed from EVEX encoding to VEX encoding.
@@ -2420,7 +2572,7 @@ void X86AsmPrinter::emitInstruction(const MachineInstr *MI) {
         MI == &MF->front().front()) {
       MCInst Inst;
       MCInstLowering.Lower(MI, Inst);
-      EmitAndCountInstruction(Inst);
+      EmitAndAlignInstruction(Inst);
       CurrentPatchableFunctionEntrySym = createTempSymbol("patch");
       OutStreamer->emitLabel(CurrentPatchableFunctionEntrySym);
       return;
@@ -2459,7 +2611,7 @@ void X86AsmPrinter::emitInstruction(const MachineInstr *MI) {
     MCSymbol *PICBase = MF->getPICBaseSymbol();
     // FIXME: We would like an efficient form for this, so we don't have to do a
     // lot of extra uniquing.
-    EmitAndCountInstruction(
+    EmitAndAlignInstruction(
         MCInstBuilder(X86::CALLpcrel32)
             .addExpr(MCSymbolRefExpr::create(PICBase, OutContext)));
 
@@ -2481,7 +2633,7 @@ void X86AsmPrinter::emitInstruction(const MachineInstr *MI) {
     OutStreamer->emitLabel(PICBase);
 
     // popl $reg
-    EmitAndCountInstruction(
+    EmitAndAlignInstruction(
         MCInstBuilder(X86::POP32r).addReg(MI->getOperand(0).getReg()));
 
     if (HasActiveDwarfFrame && !hasFP) {
@@ -2516,7 +2668,7 @@ void X86AsmPrinter::emitInstruction(const MachineInstr *MI) {
     DotExpr = MCBinaryExpr::createAdd(
         MCSymbolRefExpr::create(OpSym, OutContext), DotExpr, OutContext);
 
-    EmitAndCountInstruction(MCInstBuilder(X86::ADD32ri)
+    EmitAndAlignInstruction(MCInstBuilder(X86::ADD32ri)
                                 .addReg(MI->getOperand(0).getReg())
                                 .addReg(MI->getOperand(1).getReg())
                                 .addExpr(DotExpr));
@@ -2556,13 +2708,13 @@ void X86AsmPrinter::emitInstruction(const MachineInstr *MI) {
     return LowerPATCHABLE_TYPED_EVENT_CALL(*MI, MCInstLowering);
 
   case X86::MORESTACK_RET:
-    EmitAndCountInstruction(MCInstBuilder(getRetOpcode(*Subtarget)));
+    EmitAndAlignInstruction(MCInstBuilder(getRetOpcode(*Subtarget)));
     return;
 
   case X86::MORESTACK_RET_RESTORE_R10:
     // Return, then restore R10.
-    EmitAndCountInstruction(MCInstBuilder(getRetOpcode(*Subtarget)));
-    EmitAndCountInstruction(
+    EmitAndAlignInstruction(MCInstBuilder(getRetOpcode(*Subtarget)));
+    EmitAndAlignInstruction(
         MCInstBuilder(X86::MOV64rr).addReg(X86::R10).addReg(X86::RAX));
     return;
 
@@ -2588,7 +2740,7 @@ void X86AsmPrinter::emitInstruction(const MachineInstr *MI) {
       // looking for a call. We may emit an unnecessary nop in some cases.
       if (!MBBI->isPseudo()) {
         if (MBBI->isCall())
-          EmitAndCountInstruction(MCInstBuilder(X86::NOOP));
+          EmitAndAlignInstruction(MCInstBuilder(X86::NOOP));
         break;
       }
     }
@@ -2599,6 +2751,7 @@ void X86AsmPrinter::emitInstruction(const MachineInstr *MI) {
   MCInst TmpInst;
   MCInstLowering.Lower(MI, TmpInst);
 
+/*
   // Stackmap shadows cannot include branch targets, so we can count the bytes
   // in a call towards the shadow, but must ensure that the no thread returns
   // in to the stackmap shadow.  The only way to achieve this is if the call
@@ -2613,6 +2766,14 @@ void X86AsmPrinter::emitInstruction(const MachineInstr *MI) {
     OutStreamer->emitInstruction(TmpInst, getSubtargetInfo());
     return;
   }
+*/
+  // Jaebaek: enforce 4bytes operand to jmp and cond jmp
+   if (!MF->hasInlineAsm()) {
+    if (MI->isConditionalBranch())
+      TmpInst.setOpcode(getLongCondBr(MI->getOpcode()));
+    else if (MI->isUnconditionalBranch())
+      TmpInst.setOpcode(X86::JMP_4);
+  }
 
-  EmitAndCountInstruction(TmpInst);
+  EmitAndAlignInstruction(TmpInst);
 }

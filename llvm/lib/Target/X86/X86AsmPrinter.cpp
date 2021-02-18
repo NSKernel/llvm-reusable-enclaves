@@ -47,7 +47,8 @@ using namespace llvm;
 
 X86AsmPrinter::X86AsmPrinter(TargetMachine &TM,
                              std::unique_ptr<MCStreamer> Streamer)
-    : AsmPrinter(TM, std::move(Streamer)), SM(*this), FM(*this) {}
+    : AsmPrinter(TM, std::move(Streamer)), SM(*this), FM(*this)，
+      IC(TM), isBundled(false), bundleSize(0), bundleCall(false) {}
 
 //===----------------------------------------------------------------------===//
 // Primitive Helper Functions.
@@ -57,6 +58,9 @@ X86AsmPrinter::X86AsmPrinter(TargetMachine &TM,
 ///
 bool X86AsmPrinter::runOnMachineFunction(MachineFunction &MF) {
   Subtarget = &MF.getSubtarget<X86Subtarget>();
+
+  IC.setForNewFunction(MF);
+  units = 0;
 
   SMShadowTracker.startFunction(MF);
   CodeEmitter.reset(TM.getTarget().createMCCodeEmitter(
@@ -78,8 +82,19 @@ bool X86AsmPrinter::runOnMachineFunction(MachineFunction &MF) {
     OutStreamer->EndCOFFSymbolDef();
   }
 
+  if (MF.getAlignment() < 5)
+    MF.setAlignment(5);
+  for (MachineFunction::iterator I = MF.begin(), E = MF.end();I != E; ++I) {
+    // Every basic block should also be aligned
+    MachineBasicBlock &MBB = *I;
+    MBB.setAlignment(5);
+  }
+
   // Emit the rest of the function body.
   emitFunctionBody();
+
+  // We don't need it anymore
+  IC.free();
 
   // Emit the XRay table for this function.
   emitXRayTable();
@@ -799,4 +814,23 @@ void X86AsmPrinter::emitEndOfAsmFile(Module &M) {
 extern "C" LLVM_EXTERNAL_VISIBILITY void LLVMInitializeX86AsmPrinter() {
   RegisterAsmPrinter<X86AsmPrinter> X(getTheX86_32Target());
   RegisterAsmPrinter<X86AsmPrinter> Y(getTheX86_64Target());
+}
+
+//#include <iostream>
+
+void X86AsmPrinter::InstCounter::count(MCInst &Inst, const MCSubtargetInfo &STI) {
+  SmallString<256> Code;
+  SmallVector<MCFixup, 4> Fixups;
+  raw_svector_ostream VecOS(Code);
+  CodeEmitter->encodeInstruction(Inst, VecOS, Fixups, STI);
+  instSize = Code.size();
+  // cout << Inst.getOpcode() << " -- " << instSize << endl;
+  codeSize += instSize;
+}
+
+void X86AsmPrinter::InstCounter::setForNewFunction(MachineFunction &F) {
+  MF = &F;
+  CodeEmitter = TM.getTarget().createMCCodeEmitter(
+        *F.getSubtarget().getInstrInfo(),
+        *F.getSubtarget().getRegisterInfo(), F.getContext());
 }

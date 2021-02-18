@@ -552,6 +552,9 @@ void X86PassConfig::addPreEmitPass2() {
   if (TT.isOSWindows())
     addPass(createCFGuardLongjmpPass());
   addPass(createX86LoadValueInjectionRetHardeningPass());
+
+  // DEP+SFI: Add the pass for SFI + DEP
+  addPass(createX86SFIDEP());
 }
 
 std::unique_ptr<CSEConfigBase> X86PassConfig::getCSEConfig() const {

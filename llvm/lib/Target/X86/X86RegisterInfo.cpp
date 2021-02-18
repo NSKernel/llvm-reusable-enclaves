@@ -599,6 +599,31 @@ BitVector X86RegisterInfo::getReservedRegs(const MachineFunction &MF) const {
   assert(checkAllSuperRegsMarked(Reserved,
                                  {X86::SIL, X86::DIL, X86::BPL, X86::SPL,
                                   X86::SIH, X86::DIH, X86::BPH, X86::SPH}));
+  
+  // DEP+SFI: Use R14 & R15 for boundary
+  // R15: RW boundary
+  // R14: Memory access sanitizer / Return address sanitizer
+  Reserved.set(X86::R15);
+  Reserved.set(X86::R15D);
+  Reserved.set(X86::R15W);
+  Reserved.set(X86::R15B);
+  Reserved.set(X86::R14);
+  Reserved.set(X86::R14D);
+  Reserved.set(X86::R14W);
+  Reserved.set(X86::R14B);
+  
+  // Use R13 as the backup of RFLAGS
+  Reserved.set(X86::R13);
+  Reserved.set(X86::R13D);
+  Reserved.set(X86::R13W);
+  Reserved.set(X86::R13B);
+
+  // RBP is reserved to prevent random change to it
+  Reserved.set(X86::RBP);
+  Reserved.set(X86::EBP);
+  Reserved.set(X86::BP);
+  Reserved.set(X86::BPL);
+
   return Reserved;
 }
 
