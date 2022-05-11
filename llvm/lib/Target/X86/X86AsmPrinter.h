@@ -72,13 +72,17 @@ class LLVM_LIBRARY_VISIBILITY X86AsmPrinter : public AsmPrinter {
 
   class InstCounter {
   public:
-    InstCounter (TargetMachine &TM) : TM(TM), codeSize(0), CodeEmitter(NULL) {}
+    InstCounter (TargetMachine &TM) : TM(TM), CodeEmitter(NULL), codeSize(0) {}
     ~InstCounter () {}
     void count(MCInst &Inst, const MCSubtargetInfo &STI);
     unsigned getLastInstrSize() { return instSize; }
     unsigned getCodeSize() { return codeSize; }
-    void setCodeSize(unsigned size) { codeSize = size; }
-    void free() { delete CodeEmitter; }
+    unsigned long long getTotalCodeSize() { return totalCodeSize; }
+    void putBackCodeSize() { codeSize -= instSize; totalCodeSize -= instSize; /*printf("Bundle CodeSize -= %d\n", instSize);*/ }
+    void addCodeSize(unsigned size) { codeSize += size; totalCodeSize += size; /*printf("CodeSize += %d\n", size);*/ }
+    void putBackTotalCodeSize(unsigned size) { totalCodeSize -= size; /*printf("\nAlign CodeSize -= %d\n", size);*/ }
+    void setCodeSize(unsigned size);// { codeSize = size; }
+    void free();
     void setForNewFunction(MachineFunction &F);
   private:
     MachineFunction *MF;
@@ -86,6 +90,7 @@ class LLVM_LIBRARY_VISIBILITY X86AsmPrinter : public AsmPrinter {
     MCCodeEmitter *CodeEmitter;
     unsigned instSize;
     unsigned codeSize;
+    unsigned long long totalCodeSize = 0;
   };
   
   // Jaebaek: to handle bundled instructions
@@ -108,7 +113,7 @@ class LLVM_LIBRARY_VISIBILITY X86AsmPrinter : public AsmPrinter {
   // This helper function invokes the SMShadowTracker on each instruction before
   // outputting it to the OutStream. This allows the shadow tracker to minimise
   // the number of NOPs used for stackmap padding.
-  void EmitAndAlignInstruction(MCInst &Inst);
+  void EmitAndAlignInstruction(MCInst &Inst, bool isCall);
   void EmitAndCountInstruction(MCInst &Inst);
   void LowerSTACKMAP(const MachineInstr &MI);
   void LowerPATCHPOINT(const MachineInstr &MI, X86MCInstLower &MCIL);

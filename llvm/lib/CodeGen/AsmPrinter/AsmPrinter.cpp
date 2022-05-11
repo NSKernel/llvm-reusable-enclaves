@@ -1130,7 +1130,9 @@ void AsmPrinter::emitFunctionBody() {
       case TargetOpcode::ANNOTATION_LABEL:
       case TargetOpcode::EH_LABEL:
       case TargetOpcode::GC_LABEL:
-        OutStreamer->emitLabel(MI.getOperand(0).getMCSymbol());
+        // Make sure that every label is aligned!
+	OutStreamer->emitCodeAlignment(32);
+	OutStreamer->emitLabel(MI.getOperand(0).getMCSymbol());
         break;
       case TargetOpcode::INLINEASM:
       case TargetOpcode::INLINEASM_BR:

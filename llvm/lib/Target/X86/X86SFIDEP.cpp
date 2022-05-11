@@ -18,8 +18,10 @@
 #include "llvm/CodeGen/Passes.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
-#include "llvm/Target/TargetInstrInfo.h"
+#include "llvm/CodeGen/TargetInstrInfo.h"
 #include "llvm/MC/MCContext.h"
+
+#include <iostream>
 
 using namespace llvm;
 
@@ -27,6 +29,7 @@ namespace {
 
 class X86SFIDEP : public MachineFunctionPass {
 public:
+	static char ID;
 	X86SFIDEP() : MachineFunctionPass(ID) {}
 
 	StringRef getPassName() const override { return "X86 Shepherded Memory Access"; }
@@ -39,37 +42,61 @@ private:
 	bool nforceRegisterLargerThanR15(unsigned reg, MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBi, DebugLoc& DL);
 	bool sanitizeRSP(MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBi, bool *codeInjected);
 	//bool sanitizeRBP(MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBi);
-	bool X86SFIDEP::sanitizeMAccess(MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBi);
+	bool sanitizeMAccess(MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBi);
 
+        void enforceRegisterLargerThanR15(unsigned reg, MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBi, DebugLoc& DL);
 	// For the use of recording the last added bundle
+	MachineBasicBlock::iterator lastRFlagsChangedPointer;
 	MachineBasicBlock::iterator lastBundlePointer;
+	MachineBasicBlock *lastRFlagsChangedBB;
 
 	const TargetInstrInfo *instrInfo;
 	const TargetRegisterInfo *registerInfo;
 };
+char X86SFIDEP::ID = 0;
 
 } // end anonymous namespace
 
 bool X86SFIDEP::runOnMachineFunction(MachineFunction &MF) {
 	bool modified = false;
+	lastRFlagsChangedPointer = NULL;
+	lastRFlagsChangedBB = NULL;
 
-	if (MF.hasInlineASM()) {
+	if (MF.hasInlineAsm()) {
 		// We do not handle inline ASM
+		printf("X86SFIDEP: Warning: Inline ASM detected. This function is passed. Function name: ");
+		std::cout << MF.getName().str() << std::endl;
 		return false;
 	}
 
+	if (MF.getName().startswith("__cxx") || MF.getName().startswith("_GLOBAL")) {
+		printf("X86SFIDEP: Possible C++ initialization thing. Ignored. Name = ");
+		std::cout << MF.getName().str() << std::endl;
+		return false;
+	}
 	// Setup target related metadata
-	instrInfo = Func.getSubtarget().getInstrInfo();
-	registerInfo = Func.getSubtarget().getRegisterInfo();
+	instrInfo = MF.getSubtarget().getInstrInfo();
+	registerInfo = MF.getSubtarget().getRegisterInfo();
 
 	// We allow unsanitized functions to do minimal initialization tasks
 	// Such function shall start with a prefix of "__unsan_"
-	if ((strncmp(Func.getName(), "__unsan_", 8)) {
+	if (MF.getName().startswith("__unsan_")) {
+		//	(strncmp(MF.getName(), "__unsan_", 8))) {
 		// Allow unsanitized functions
 		return false;
 	}
 
-	for (MachineFunction::iterator i = Func.begin(), end = Func.end(); i != end; ++i) {
+	if (!MF.getName().compare(StringRef("main"))) {
+		printf("X86SFIDEP: main found. Appended %%r15 = 0\n");
+		MachineFunction::iterator MBB = MF.begin();
+		MachineBasicBlock::iterator MBBI = MBB->begin();
+		MachineInstr &MI = *MBBI;
+		DebugLoc DL = MI.getDebugLoc();
+		
+		BuildMI(*MBB, MBBI, DL, instrInfo->get(X86::MOV64ri), X86::R15).addImm(0);
+	}
+
+	for (MachineFunction::iterator i = MF.begin(), end = MF.end(); i != end; ++i) {
 		modified |= sanitize(*i);	
 	}
 
@@ -87,14 +114,20 @@ static bool hasControlFlow(const MachineInstr &MI) {
 
 // False-positive-prone code. Could lead to performance issue
 // but will not introduce false-negative
-static bool effectOnRFlags(const MachineInstr &MI) {
+static bool effectOnRFlags(const MachineInstr &MI, const TargetRegisterInfo *registerInfo) {
+	if (MI.modifiesRegister(X86::EFLAGS, registerInfo))
+		return true;
+	
 	if (MI.getDesc().isCompare()) return true;
 	if (hasControlFlow(MI)) return false;
 	unsigned Opc = MI.getOpcode();
 	if (X86::MOV16ao16 <= Opc && Opc <= X86::MOVZX64rr8) return false;
 	if (X86::LEA16r <= Opc && Opc <= X86::LEA64r) return false;
-	if (X86::CMOVA16rm <= Opc && Opc <= X86::CMOV_V8I64) return false;
-	if (X86::SETAEm <= Opc && Opc <= X86::SETSr) return false;
+	if (X86::CMOV16rr <= Opc && Opc <= X86::CMOV64rr) return false;
+	if (X86::CMOV16rm <= Opc && Opc <= X86::CMOV64rm) return false;
+	if (X86::CMOV_GR8 <= Opc && Opc <= X86::CMOV_VK64) return false;
+	//if (X86::CMOVA16rm <= Opc && Opc <= X86::CMOV_V8I64) return false;
+	if (Opc == X86::SETCCm && Opc == X86::SETCCr) return false;
 	if (Opc == X86::LOOPE || Opc == X86::LOOPNE) return false;
 	/*
 	if (X86::DEC16m <= Opc && Opc <= X86::DEC8r) return true;
@@ -105,8 +138,13 @@ static bool effectOnRFlags(const MachineInstr &MI) {
 static bool isCondInstr(const MachineInstr &MI) {
 	if (MI.getDesc().isConditionalBranch()) return true;
 	unsigned Opc = MI.getOpcode();
-	if (X86::CMOVA16rm <= Opc && Opc <= X86::CMOV_V8I64) return true;
-	if (X86::SETAEm <= Opc && Opc <= X86::SETSr) return true;
+	//if (X86::CMOVA16rm <= Opc && Opc <= X86::CMOV_V8I64) return true;
+	//if (X86::SETAEm <= Opc && Opc <= X86::SETSr) return true;
+	if (X86::CMOV16rr <= Opc && Opc <= X86::CMOV64rr) return true;
+	if (X86::CMOV16rm <= Opc && Opc <= X86::CMOV64rm) return true;
+        if (X86::CMOV_GR8 <= Opc && Opc <= X86::CMOV_VK64) return true;
+        //if (X86::CMOVA16rm <= Opc && Opc <= X86::CMOV_V8I64) return true;
+        if (Opc == X86::SETCCm && Opc == X86::SETCCr) return true;
 	if (Opc == X86::LOOPE || Opc == X86::LOOPNE) return true;
 	return false;
 }
@@ -152,16 +190,21 @@ bool X86SFIDEP::alignBranch(MachineBasicBlock &MBB, MachineBasicBlock::iterator 
 	// o SGX app cannot be an interrupt handler
 	// o We only allow flat memory space so there won't be a far call
 	else if (Opcode == X86::RETL) {
+		// No sanitization for main
+		if (!MBB.getParent()->getName().compare(StringRef("main"))) {
+			printf("X86SFIDEP: main's return is left untouched\n");
+			return false;
+		}
 		// Pop 32-bit to R14
-		MachineInstr *popMI = BuildMI(MBB, MBBi, DL, TII->get(X86::POP32r)).addReg(X86::R14D);
+		MachineInstr *popMI = BuildMI(MBB, MBBi, DL, instrInfo->get(X86::POP32r)).addReg(X86::R14D);
 		MachineBasicBlock::iterator POPi = popMI;
 
 		// Align
-		BuildMI(MBB, MBBi, DL, TII->get(X86::AND32ri8), X86::R14D).addReg(X86::R14D).addImm(-32);
+		BuildMI(MBB, MBBi, DL, instrInfo->get(X86::AND32ri8), X86::R14D).addReg(X86::R14D).addImm(-32);
 		// To next basic block
-		BuildMI(MBB, MBBi, DL, TII->get(X86::ADD32ri8), X86::R14D).addReg(X86::R14D).addImm(32);
+		BuildMI(MBB, MBBi, DL, instrInfo->get(X86::ADD32ri8), X86::R14D).addReg(X86::R14D).addImm(32);
 		// RETL
-		MachineInstr *jmpMI = BuildMI(MBB, MBBi, DL, TII->get(X86::JMP32r)).addReg(X86::R14D);
+		MachineInstr *jmpMI = BuildMI(MBB, MBBi, DL, instrInfo->get(X86::JMP32r)).addReg(X86::R14D);
 		MachineBasicBlock::iterator JMPI = jmpMI;
 
 		lastBundlePointer = POPi;
@@ -173,22 +216,27 @@ bool X86SFIDEP::alignBranch(MachineBasicBlock &MBB, MachineBasicBlock::iterator 
 		return true;
 	}
 	else if (Opcode == X86::RETQ) {
+		// No sanitization for main
+                if (!MBB.getParent()->getName().compare(StringRef("main"))) {
+                        printf("X86SFIDEP: main's return is left untouched\n");
+			return false;
+                }
 		// Pop 64-bit to R14
-		MachineInstr *popMI = BuildMI(MBB, MBBi, DL, TII->get(X86::POP64r)).addReg(X86::R14);
+		MachineInstr *popMI = BuildMI(MBB, MBBi, DL, instrInfo->get(X86::POP64r)).addReg(X86::R14);
 		MachineBasicBlock::iterator POPi = popMI;
 
 		// Align
-		BuildMI(MBB, MBBi, DL, TII->get(X86::AND64ri8), X86::R14).addReg(X86::R14).addImm(-32);
+		BuildMI(MBB, MBBi, DL, instrInfo->get(X86::AND64ri8), X86::R14).addReg(X86::R14).addImm(-32);
 		// To next basic block
-		BuildMI(MBB, MBBi, DL, TII->get(X86::ADD64ri8), X86::R14).addReg(X86::R14).addImm(32);
+		BuildMI(MBB, MBBi, DL, instrInfo->get(X86::ADD64ri8), X86::R14).addReg(X86::R14).addImm(32);
 		// RETL
-		MachineInstr *jmpMI = BuildMI(MBB, MBBi, DL, TII->get(X86::JMP64r)).addReg(X86::R14);
+		MachineInstr *jmpMI = BuildMI(MBB, MBBi, DL, instrInfo->get(X86::JMP64r)).addReg(X86::R14);
 		MachineBasicBlock::iterator JMPI = jmpMI;
 
 		lastBundlePointer = POPi;
 
 		MI.eraseFromParent();
-		MIBundleBuilder(MBB, POPi, JMPI + 1);
+		MIBundleBuilder(MBB, POPi, std::next(JMPI));
 		finalizeBundle(MBB, POPi.getInstrIterator());
 
 		return true;
@@ -201,15 +249,14 @@ bool X86SFIDEP::alignBranch(MachineBasicBlock &MBB, MachineBasicBlock::iterator 
 	    Opcode == X86::TAILJMPr64) {
 		// We must ensure that all targets are aligned to 32 bytes
 		unsigned RegisterX = MI.getOperand(0).getReg();
-		unsigned RegisteRegisterX32 = getX86SubSuperRegister(RegisterX, 32, false);
 		
-		MachineInstr *andMi = BuildMI(MBB, MBBi, DL, instrInfo->get(X86::AND32ri8), RegisterX32).addReg(RegisterX32).addImm(-32);
+		MachineInstr *andMi = BuildMI(MBB, MBBi, DL, instrInfo->get(X86::AND64ri8), RegisterX).addReg(RegisterX).addImm(-32);
 		MachineBasicBlock::iterator ANDi = andMi;
 
 		lastBundlePointer = ANDi;
 
 		// Make our injected code plus the original branch instruction as a bundle
-		MIBundleBuilder(MBB, ANDi, MBBi + 1);
+		MIBundleBuilder(MBB, ANDi, std::next(MBBi));
 		finalizeBundle(MBB, ANDi.getInstrIterator());
 		return true;
 	}
@@ -219,7 +266,9 @@ bool X86SFIDEP::alignBranch(MachineBasicBlock &MBB, MachineBasicBlock::iterator 
 
 void X86SFIDEP::enforceRegisterLargerThanR15(unsigned reg, MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBi, DebugLoc& DL) {
 	// Inserts the following
-	//    sub %r15d, %exx
+	//    sub %r15, %rxx
+	//    shl $1, %rxx
+	//    shr $1, %rxx
 	//    lea (%rxx, %r15, 1), %rxx
 	// This sanitization can poop because it only allows %rxx - %r15 < 0xFFFFFFFF
 	// Also this sanitization isn't even totally correct since it also requires
@@ -230,7 +279,6 @@ void X86SFIDEP::enforceRegisterLargerThanR15(unsigned reg, MachineBasicBlock &MB
 	// o Bad but safe behaviour: %rxx - %15 >= 4GB
 	// o Unsafe: %r15 >= 0xFFFFFFFF000000001 (in kernel space)
 	
-	unsigned reg32 = getX86SubSuperRegister(reg, 32, false);
 	MachineFunction &MF = *MBB.getParent();
 
 	MachineInstr *LEA = MF.CreateMachineInstr(instrInfo->get(X86::LEA64r), DL);
@@ -238,8 +286,9 @@ void X86SFIDEP::enforceRegisterLargerThanR15(unsigned reg, MachineBasicBlock &MB
 	MachineInstrBuilder(MF, LEA).addReg(reg).addReg(reg).addImm(1).addReg(X86::R15).addImm(0).addReg(0);
 	MachineBasicBlock::iterator LEAi = LEA;
 
-	BuildMI(MBB, LEAi, DL, instrInfo->get(X86::SUB32rr), reg32).addReg(reg32).addReg(X86::R15D);
-
+	BuildMI(MBB, LEAi, DL, instrInfo->get(X86::SUB64rr), reg).addReg(reg).addReg(X86::R15);
+	BuildMI(MBB, LEAi, DL, instrInfo->get(X86::SHL64ri), reg).addReg(reg).addImm(1);
+        BuildMI(MBB, LEAi, DL, instrInfo->get(X86::SHR64ri), reg).addReg(reg).addImm(1);
 	lastBundlePointer = MBBi;
 
 	MIBundleBuilder(MBB, MBBi, ++LEAi);
@@ -278,36 +327,50 @@ bool X86SFIDEP::sanitizeRSP(MachineBasicBlock &MBB, MachineBasicBlock::iterator 
 	DebugLoc DL = MI.getDebugLoc();
 	unsigned int Opcode = MI.getOpcode();
 
-	if (Opcode == X86::PUSH64r || Opcode == X86::POP64r) {
+	//if (Opcode == X86::PUSH64r || Opcode == X86::POP64r || Opcode == X86::PUSHF16 || Opcode == X86) {
 		// Only push and pop. The change to RSP is controllable and will not
 		// be over 8 bytes
-		return false;
-	}
+	//	return false;
+	//}
 
 	switch (Opcode) {
+	// PUSH/POP
+	case X86::PUSH64r:
+	case X86::PUSH64i8:
+	case X86::PUSH64i32:
+	case X86::PUSH64rmm:
+	case X86::PUSH64rmr:	
+	case X86::POP64r:
+	case X86::PUSHF16:
+	case X86::POPF16:
+	case X86::PUSHF32:
+        case X86::POPF32:
+	case X86::PUSHF64:
+        case X86::POPF64:
+		return false;
 	// SUB
 	case X86::SUB64ri8:
 	case X86::SUB64ri32:
+		{
 		// subq $a, %rsp
 		// =>
-		// subl %r15d, %esp   // Offset
-		// subl $a, %esp      // Offset - a
+		// subq %r15, %rsp   // Offset
+		// subq $a, %rsp     // Offset - a
+		// andq 0x7fffffffffffffff, %rsp
+		//                   // Make sure that Offset is smaller
+		//                   // than the one that can overflow
+		//                   // since R15 must be smaller than 
+		//                   // 0x8000000000000000
 		// leaq (%rsp, %r15, 1), %rsp
-		//
-		// Note that the subd will actually zero out the upper 32 bits of
-		// %rsp so no worry here
-		unsigned sanitizeOpcode;
-		if (Opcode == X86::SUB64ri8) {
-			sanitizeOpcode = X86::SUB32ri8;
-		}
-		else {
-			sanitizeOpcode = X86::SUB32ri32;
-		}
+		// unsigned sanitizeOpcode;
 
-		MachineInstr *subMI = BuildMI(MBB, MBBi, DL, instrInfo->get(X86::SUB32rr), X86::ESP).addReg(X86::ESP).addReg(X86::R15D);
+		MachineInstr *subMI = BuildMI(MBB, MBBi, DL, instrInfo->get(X86::SUB64rr), X86::RSP).addReg(X86::RSP).addReg(X86::R15);
 		MachineBasicBlock::iterator SUBi = subMI;
 
-		BuildMI(MBB, MBBi, DL, instrInfo->get(sanitizeOpcode), X86::ESP).addReg(X86::ESP).addImm(MI.getOperand(2).getImm());
+		BuildMI(MBB, MBBi, DL, instrInfo->get(Opcode), X86::RSP).addReg(X86::RSP).addImm(MI.getOperand(2).getImm());
+
+		BuildMI(MBB, MBBi, DL, instrInfo->get(X86::MOV64ri), X86::R14).addImm(0x7fffffffffffffff);
+		BuildMI(MBB, MBBi, DL, instrInfo->get(X86::AND64rr), X86::RSP).addReg(X86::RSP).addReg(X86::R14);
 
 		MachineInstr *leaMI = BuildMI(MBB, MBBi, DL, instrInfo->get(X86::LEA64r)).addReg(X86::RSP).addReg(X86::RSP).addImm(1).addReg(X86::R15).addImm(0).addReg(0);
 		MachineBasicBlock::iterator LEAi = leaMI;
@@ -321,6 +384,7 @@ bool X86SFIDEP::sanitizeRSP(MachineBasicBlock &MBB, MachineBasicBlock::iterator 
 		MIBundleBuilder(MBB, SUBi, ++LEAi);
 		finalizeBundle(MBB, SUBi.getInstrIterator());
 		return true;
+		}
 	case X86::SUB64rr: case X86::SUB32rr: case X86::SUB16rr:
 	case X86::SUB8rr: case X86::SUB32ri: case X86::SUB32ri8:
 	case X86::SUB16ri: case X86::SUB16ri8: case X86::SUB8ri:
@@ -407,7 +471,10 @@ bool X86SFIDEP::sanitizeRSP(MachineBasicBlock &MBB, MachineBasicBlock::iterator 
 		return true;
 	}
 
-	llvm_unreachable("Unexpected to see an unhandled instruction modifying RSP");
+	//llvm_unreachable
+	printf("X86SFIDEP: Unexpected to see an unhandled instruction modifying RSP in");
+	std::cout << MBB.getParent()->getName().str() << ". Instruction is: " << MI.getOpcode() << std::endl;
+	return false;
 }
 
 /* We reserved RBP so this is not necessary anymore
@@ -422,7 +489,18 @@ bool X86SFIDEP::sanitizeRBP(MachineBasicBlock &MBB, MachineBasicBlock::iterator 
 static bool findMemoryOperand(const MachineInstr &MI,
 	SmallVectorImpl<unsigned>* indices) {
 	int NumFound = 0;
+	Register OperandReg;
+	bool warnForUnsan = false;
 	for (unsigned i = 0; i < MI.getNumOperands(); ) {
+		if (MI.getOperand(i).isReg()) {
+			// NOT SECURE! SHOULD USE ALTERNATIVE WAY
+			// Go see the sanitization code's comment
+			OperandReg = MI.getOperand(i).getReg();
+			if (OperandReg == X86::AH || OperandReg == X86::CH ||
+			    OperandReg == X86::BH || OperandReg == X86::DH) {
+				warnForUnsan = true;
+			}
+		}
 		if (isMem(MI, i)) {
 			NumFound++;
 			indices->push_back(i);
@@ -438,6 +516,10 @@ static bool findMemoryOperand(const MachineInstr &MI,
 	// explicit memory references in the instruction, of which there are none.
 	if (NumFound == 0)
 		return false;
+	if (warnForUnsan == true) {
+		printf("X86SFIDEP: Warning! Unsanitized due to REX collision with high byte registers!\n!");
+		return false;
+	}
 	return true;
 }
 
@@ -469,12 +551,13 @@ bool X86SFIDEP::sanitizeMAccess(MachineBasicBlock &MBB, MachineBasicBlock::itera
 		MachineOperand &IndexReg  = MI.getOperand(MemOp + 2);
 		MachineOperand &Disp = MI.getOperand(MemOp + 3);
 		MachineOperand &SegmentReg = MI.getOperand(MemOp + 4);
-		// If one of RIP, RBP and RSP is a base reg
+		// If one of RIP, RBP, R12 and RSP is a base reg
 		// and no index reg, it is safe
 		// --> because the attacker cannot change the dest address
 		if ((BaseReg.getReg() == X86::RIP
 			|| BaseReg.getReg() == X86::RBP
-			|| BaseReg.getReg() == X86::RSP)
+			|| BaseReg.getReg() == X86::RSP
+			|| BaseReg.getReg() == X86::R12)
 			&& IndexReg.getReg() == 0
 			&& SegmentReg.getReg() == 0)
 		  	continue;	
@@ -482,16 +565,21 @@ bool X86SFIDEP::sanitizeMAccess(MachineBasicBlock &MBB, MachineBasicBlock::itera
 		MachineBasicBlock::iterator head;
 		/*
 		  before:
-		   mov  src, (base)
+		   mov  src, (xx:base)
 		  after:
-		   sub  %r15d, %base-lower
-		   mov  src, (%r15, %base, 1)
+		   sub  %r15, %base
+		   mov  0x7fffffffffffffff, %r14
+		   and  %
+		   mov  src, (xx:%r15, %base, 1)
 		 */
 		if (0) {// (IndexReg.getReg() == 0) {
 			rX = BaseReg.getReg();
-			unsigned rX32 = getX86SubSuperRegister(rX, 32, false);
-			MachineInstr *subMI = BuildMI(MBB, MBBi, DL, TII->get(X86::SUB32rr), rX32).addReg(rX32).addReg(X86::R15D);
+			//unsigned rX32 = getX86SubSuperRegister(rX, 32, false);
+			MachineInstr *subMI = BuildMI(MBB, MBBi, DL, instrInfo->get(X86::SUB64rr), rX).addReg(rX).addReg(X86::R15);
+
+			
 			head = subMI;
+
 		}
 		else {
 		  /*
@@ -499,21 +587,38 @@ bool X86SFIDEP::sanitizeMAccess(MachineBasicBlock &MBB, MachineBasicBlock::itera
 		     xxx  src, disp(base, index, scale)
 		    after:
 		     lea  disp(base, index, scale), %r14
-		     sub  %r15d, %r14d
+		     sub  %r15, %r14
+		     shl  $1, %r14
+		     shr  $1, %r14
 		     xxx  src, (%r15, %r14, 1)
 		   */
+		   /*
+		    * TODO
+		    * Note that as a workaround to REX-encoding
+		    * preventing us from doing
+		    *   xxx (%r15, %r14, 1), %ah
+		    * We are temporarily disabling the sanitizaion
+		    * for such instruction. We can use something
+		    * like
+		    *   backup rbx
+		    *   lea (%r15, %r14, 1), %rbx
+		    *   xxx src, (%rbx)
+		    * but that is left to future works
+		    */
 			rX = X86::R14;
-			MachineInstr *leaMI = BuildMI(MBB, MBBi, DL, TII->get(X86::LEA64r)).addReg(X86::R14).addReg(BaseReg.getReg()).addOperand(Scale).addReg(IndexReg.getReg()).addOperand(Disp).addReg(SegmentReg.getReg());
+			MachineInstr *leaMI = BuildMI(MBB, MBBi, DL, instrInfo->get(X86::LEA64r)).addReg(X86::R14).addReg(BaseReg.getReg()).add(Scale).addReg(IndexReg.getReg()).add(Disp).addReg(0);
 			head = leaMI;	
-			BuildMI(MBB, MBBi, DL, TII->get(X86::SUB32rr), X86::R14D).addReg(X86::R14D).addReg(X86::R15D);
+			BuildMI(MBB, MBBi, DL, instrInfo->get(X86::SUB64rr), X86::R14).addReg(X86::R14).addReg(X86::R15);
+			BuildMI(MBB, MBBi, DL, instrInfo->get(X86::SHL64ri), X86::R14).addReg(X86::R14).addImm(1);
+			BuildMI(MBB, MBBi, DL, instrInfo->get(X86::SHR64ri), X86::R14).addReg(X86::R14).addImm(1);
 		}	
 		MachineInstrBuilder rebuiltMI = BuildMI(MBB, MBBi, DL, MI.getDesc());
 		for (unsigned i = 0;i < MI.getNumOperands();) {
 			if (i != MemOp) {
-				rebuiltMI.addOperand(MI.getOperand(i));
+				rebuiltMI.add(MI.getOperand(i));
 				++i;
 			} else {
-				rebuiltMI.addReg(X86::R15).addImm(1).addReg(rX).addImm(0).addReg(0);
+				rebuiltMI.addReg(X86::R15).addImm(1).addReg(rX).addImm(0).addReg(SegmentReg.getReg());
 				i += 5;
 			}
 		}
@@ -543,14 +648,14 @@ bool X86SFIDEP::sanitize(MachineBasicBlock &MBB) {
 
 
 	unsigned int i = 0, lastRFlagsChangedIndex = 0, lastInjectedCodeIndex = 0;
-	MachineBasicBlock::iterator lastRFlagsChangedPointer = NULL;
 	for (MachineBasicBlock::iterator MBBi = MBB.begin(), NextMBBi = MBBi;
 		MBBi != MBB.end(); MBBi = ++NextMBBi, ++i) {
 
-		if (effectOnRFlags(*MBBi)) {
+		if (effectOnRFlags(*MBBi, registerInfo)) {
 			// We save the *last RFLAGS modified* index and pointer
 			lastRFlagsChangedIndex = i;
 			lastRFlagsChangedPointer = MBBi;
+			lastRFlagsChangedBB = &MBB;
 		}
 
 		if (isCondInstr(*MBBi)) {
@@ -561,16 +666,18 @@ bool X86SFIDEP::sanitize(MachineBasicBlock &MBB) {
 				// injected code
 
 				// Save to R13
-        			DebugLoc DL = (*lastRFlagsChangedPointer).getDebugLoc();
-				BuildMI(MBB, lastRFlagsChangedPointer + 1, DL, instrInfo->get(X86:PUSHF16));
-				BuildMI(MBB, lastRFlagsChangedPointer + 2, DL, instrInfo->get(X86:POP16)).addReg(X86::R13W);
+        			assert(lastRFlagsChangedPointer != NULL && lastRFlagsChangedBB != NULL);
+				DebugLoc DL = (*lastRFlagsChangedPointer).getDebugLoc();
+				MachineBasicBlock::iterator lastRFlagsChangedNext = std::next(lastRFlagsChangedPointer);	
+				BuildMI(*lastRFlagsChangedBB, lastRFlagsChangedNext, DL, instrInfo->get(X86::PUSHF16));
+				BuildMI(*lastRFlagsChangedBB, lastRFlagsChangedNext, DL, instrInfo->get(X86::POP16r)).addReg(X86::R13W);
 
 				MachineBasicBlock::iterator lastBundleIterator = lastBundlePointer;
         			while (++lastBundleIterator != MBB.end() && (*lastBundleIterator).isInsideBundle());
         			DL = (*lastBundleIterator).getDebugLoc();
 				// Now lastBundleIterator points to the first instruction out of the bundle
-        			BuildMI(MBB, lastBundleIterator, DL, instrInfo->get(X86::PUSH16)).addReg(X86::R13W);
-				BuildMI(MBB, lastBundleIterator + 1, DL, instrInfo->get(X86:POPF16));
+        			BuildMI(MBB, lastBundleIterator, DL, instrInfo->get(X86::PUSH16r)).addReg(X86::R13W);
+				BuildMI(MBB, lastBundleIterator, DL, instrInfo->get(X86::POPF16));
 
         			lastInjectedCodeIndex = 0; // <-- this enforce pushf / popf only once for sub
 			}

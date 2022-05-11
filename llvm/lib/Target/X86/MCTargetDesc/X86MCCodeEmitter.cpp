@@ -1288,9 +1288,11 @@ bool X86MCCodeEmitter::emitREXPrefix(int MemOperand, const MCInst &MI,
     case X86II::MRMDestMemFSIB:
       llvm_unreachable("FSIB format never need REX prefix!");
     }
-    if (REX && UsesHighByteReg)
+    if (REX && UsesHighByteReg) {
+      printf("Opcode = %d\n", MI.getOpcode());
       report_fatal_error(
           "Cannot encode high byte register in REX-prefixed instruction");
+    }
     return REX;
   }();
 

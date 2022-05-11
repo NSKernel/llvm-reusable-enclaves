@@ -47,8 +47,8 @@ using namespace llvm;
 
 X86AsmPrinter::X86AsmPrinter(TargetMachine &TM,
                              std::unique_ptr<MCStreamer> Streamer)
-    : AsmPrinter(TM, std::move(Streamer)), SM(*this), FM(*this)，
-      IC(TM), isBundled(false), bundleSize(0), bundleCall(false) {}
+    : AsmPrinter(TM, std::move(Streamer)), SM(*this), FM(*this),
+      isBundled(false), bundleSize(0), bundleCall(false), IC(TM) {}
 
 //===----------------------------------------------------------------------===//
 // Primitive Helper Functions.
@@ -83,11 +83,11 @@ bool X86AsmPrinter::runOnMachineFunction(MachineFunction &MF) {
   }
 
   if (MF.getAlignment() < 5)
-    MF.setAlignment(5);
+    MF.setAlignment(Align(32));
   for (MachineFunction::iterator I = MF.begin(), E = MF.end();I != E; ++I) {
     // Every basic block should also be aligned
     MachineBasicBlock &MBB = *I;
-    MBB.setAlignment(5);
+    MBB.setAlignment(Align(1));
   }
 
   // Emit the rest of the function body.
@@ -826,6 +826,27 @@ void X86AsmPrinter::InstCounter::count(MCInst &Inst, const MCSubtargetInfo &STI)
   instSize = Code.size();
   // cout << Inst.getOpcode() << " -- " << instSize << endl;
   codeSize += instSize;
+  totalCodeSize += instSize;
+  // printf("Add CodeSize += %d\n", instSize);
+}
+
+void X86AsmPrinter::InstCounter::setCodeSize(unsigned size) {
+  codeSize = size;
+  // Move to next unit:
+  if (totalCodeSize % 32 == 0) {
+	  totalCodeSize += size;
+	  //printf("Aligned to %llx\n", totalCodeSize);
+  }
+  else {
+  	totalCodeSize += 32;
+  	totalCodeSize &= 0xFFFFFFFFFFFFFFE0;
+  	totalCodeSize += size;
+	//printf("Aligned and added to %llx\n", totalCodeSize);
+  }
+}
+
+void X86AsmPrinter::InstCounter::free() {
+	delete CodeEmitter;
 }
 
 void X86AsmPrinter::InstCounter::setForNewFunction(MachineFunction &F) {

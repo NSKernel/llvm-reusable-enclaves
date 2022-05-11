@@ -618,6 +618,12 @@ BitVector X86RegisterInfo::getReservedRegs(const MachineFunction &MF) const {
   Reserved.set(X86::R13W);
   Reserved.set(X86::R13B);
 
+  // Use R12 for code access
+  Reserved.set(X86::R12);
+  Reserved.set(X86::R12D);
+  Reserved.set(X86::R12W);
+  Reserved.set(X86::R12B);
+
   // RBP is reserved to prevent random change to it
   Reserved.set(X86::RBP);
   Reserved.set(X86::EBP);

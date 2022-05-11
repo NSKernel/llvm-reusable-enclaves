@@ -122,27 +122,28 @@ void X86AsmPrinter::StackMapShadowTracker::emitShadowPadding(
   }
 }
 
-void X86AsmPrinter::EmitAndAlignInstruction(MCInst &Inst) {
-  if (MF->hasInlineAsm()) {
+void X86AsmPrinter::EmitAndAlignInstruction(MCInst &Inst, bool isCall) {
+  /*if (MF->hasInlineAsm()) {
     // If the current machine function has inline assembly,
     // we will give it a pass
     EmitAndCountInstruction(Inst);
     return;
-  }
+  }*/
 
   // Avoid 8-bit PC-Relative jump
   if (Inst.getOpcode() == X86::JMP_1)
     Inst.setOpcode(X86::JMP_4);
-  
+
   // Count the current instruction
   IC.count(Inst, getSubtargetInfo());
   unsigned isz = IC.getLastInstrSize();
-
+  
   // If in bundle, we add the instruction size to the bundle then return
   // We should not break the bundle so it should be treated as one "instruction"
   if (isBundled) {
     bundleSize += isz;
     bundledInst.push_back(Inst);
+    IC.putBackCodeSize();
     return;
   }
 
@@ -179,16 +180,35 @@ void X86AsmPrinter::EmitAndAlignInstruction(MCInst &Inst) {
     //else {
 
     // The next unit
+    IC.putBackTotalCodeSize(isz);
     IC.setCodeSize(isz);
     EmitAndCountInstruction(Inst);
 
     //}
     
-    return;
   }
-  
-  // Elsewise just directly emit
-  EmitAndCountInstruction(Inst);
+  else {
+    // Elsewise just directly emit
+    EmitAndCountInstruction(Inst);
+  }
+
+  // If it is CALLx, the next instruction is not regarded
+  // as a new basic block. In such situation, we will have
+  // to emit alignment by ourselves
+  if (isCall) {
+    OutStreamer->emitCodeAlignment(SFIDEPAlignmentUnit);
+    IC.setCodeSize(0);
+  }
+  if (Inst.getOpcode() == X86::JMP64m || Inst.getOpcode() == X86::JMP64r ||
+      Inst.getOpcode() == X86::JMP32m || Inst.getOpcode() == X86::JMP32r ||
+      Inst.getOpcode() == X86::JCC_1  || Inst.getOpcode() == X86::JCC_2  ||
+      Inst.getOpcode() == X86::JCC_4  || Inst.getOpcode() == X86::JMP_1  ||
+      Inst.getOpcode() == X86::JMP_2  || Inst.getOpcode() == X86::JMP_4) {
+    // For some cases like switch-case, JMP does not generate
+    // a new basic block
+    OutStreamer->emitCodeAlignment(SFIDEPAlignmentUnit);
+    IC.setCodeSize(0);
+  }
 }
 
 void X86AsmPrinter::EmitAndCountInstruction(MCInst &Inst) {
@@ -387,12 +407,15 @@ MCOperand X86MCInstLower::LowerSymbolOperand(const MachineOperand &MO,
 /// a short fixed-register form.
 static void SimplifyShortImmForm(MCInst &Inst, unsigned Opcode) {
   unsigned ImmOp = Inst.getNumOperands() - 1;
-  assert(Inst.getOperand(0).isReg() &&
+  if (!(Inst.getOperand(0).isReg() &&
          (Inst.getOperand(ImmOp).isImm() || Inst.getOperand(ImmOp).isExpr()) &&
          ((Inst.getNumOperands() == 3 && Inst.getOperand(1).isReg() &&
            Inst.getOperand(0).getReg() == Inst.getOperand(1).getReg()) ||
-          Inst.getNumOperands() == 2) &&
-         "Unexpected instruction!");
+          Inst.getNumOperands() == 2))) {
+         printf("MCInstrLower: Unexpected instruction! ");
+	 printf("Opcode is: %d\n", Inst.getOpcode());
+  	 llvm_unreachable("Abort!");
+  }
 
   // Check whether the destination register can be fixed.
   unsigned Reg = Inst.getOperand(0).getReg();
@@ -2438,12 +2461,13 @@ static void addConstantComments(const MachineInstr *MI,
 static unsigned getLongCondBr(unsigned opc)
 {
   switch (opc) {
-    CASE(O); CASE(NO); CASE(B);
+    /*CASE(O); CASE(NO); CASE(B);
     CASE(AE); CASE(E); CASE(NE);
     CASE(BE); CASE(A); CASE(S);
     CASE(NS); CASE(P); CASE(NP);
     CASE(L); CASE(GE); CASE(LE);
-    CASE(G);
+    CASE(G);*/
+    case X86::JCC_1:  return X86::JCC_4;
     case X86::JECXZ: return X86::JECXZ;
     case X86::JRCXZ: return X86::JRCXZ;
     default: assert(!"It is not Cond Br");
@@ -2461,16 +2485,25 @@ void X86AsmPrinter::emitInstruction(const MachineInstr *MI) {
    * Emit bundle
    */
   if (!MF->hasInlineAsm()) {
-    assert(!MI->isIndirectBranch() && "Jaebaek there exists indirect jump!");
+    if (MI->isIndirectBranch(MachineInstr::IgnoreBundle) && !MI->getIterator()->isInsideBundle()) {
+	
+	printf("INDIRECT BRANCH that is not sanitized!\n");
+        printf("Offset in current block %llx\n", IC.getTotalCodeSize());
+    }
     isUncondBranch = (MI->isReturn() || MI->isUnconditionalBranch() || MI->isIndirectBranch());
     /* Jaebaek: Soft-DEP & SFI --> handle disappeared bundle instructions */
     if (MI->isBundle()) {
       isBundled = true;
+      bool isBranchInBundle = false;
       MachineBasicBlock::const_instr_iterator I = MI->getIterator();
       MachineBasicBlock::const_instr_iterator E = MI->getParent()->instr_end();
       while (++I != E && I->isInsideBundle()) {
         const MachineInstr &tmpI = *I;
-        EmitInstruction(&tmpI);
+        emitInstruction(&tmpI);
+	if (I->getOpcode() == X86::JMP64r || I->getOpcode() == X86::CALL64r ||
+			I->getOpcode() == X86::TAILJMPr64) {
+	  isBranchInBundle = true;
+	}
       }
 
       // Instr before the bundle and the bundle exceeds (32 - 5) bytes
@@ -2502,7 +2535,7 @@ void X86AsmPrinter::emitInstruction(const MachineInstr *MI) {
         */
 
         // Going to the next unit
-        OutStreamer->EmitCodeAlignment(SFIDEPAlignmentUnit);
+        OutStreamer->emitCodeAlignment(SFIDEPAlignmentUnit);
         IC.setCodeSize(bundleSize);
         // Emit the bundle in the next unit
         for (unsigned i = 0, e = bundledInst.size(); i != e; ++i) {
@@ -2512,10 +2545,18 @@ void X86AsmPrinter::emitInstruction(const MachineInstr *MI) {
         // Directly emit the bundle since it fits
         for (unsigned i = 0, e = bundledInst.size(); i != e; ++i)
           EmitAndCountInstruction(bundledInst[i]);
+        IC.addCodeSize(bundleSize);
+      }
+
+      if (isBranchInBundle) {
+        // Align
+	OutStreamer->emitCodeAlignment(SFIDEPAlignmentUnit);
+	IC.setCodeSize(bundleSize);
       }
 
       bundledInst.clear();
       isBundled = false;
+      isBranchInBundle = false;
       bundleSize = 0;
       return;
     }
@@ -2572,7 +2613,7 @@ void X86AsmPrinter::emitInstruction(const MachineInstr *MI) {
         MI == &MF->front().front()) {
       MCInst Inst;
       MCInstLowering.Lower(MI, Inst);
-      EmitAndAlignInstruction(Inst);
+      EmitAndAlignInstruction(Inst, MI->getDesc().isCall());
       CurrentPatchableFunctionEntrySym = createTempSymbol("patch");
       OutStreamer->emitLabel(CurrentPatchableFunctionEntrySym);
       return;
@@ -2613,7 +2654,7 @@ void X86AsmPrinter::emitInstruction(const MachineInstr *MI) {
     // lot of extra uniquing.
     EmitAndAlignInstruction(
         MCInstBuilder(X86::CALLpcrel32)
-            .addExpr(MCSymbolRefExpr::create(PICBase, OutContext)));
+            .addExpr(MCSymbolRefExpr::create(PICBase, OutContext)), false);
 
     const X86FrameLowering *FrameLowering =
         MF->getSubtarget<X86Subtarget>().getFrameLowering();
@@ -2634,7 +2675,7 @@ void X86AsmPrinter::emitInstruction(const MachineInstr *MI) {
 
     // popl $reg
     EmitAndAlignInstruction(
-        MCInstBuilder(X86::POP32r).addReg(MI->getOperand(0).getReg()));
+        MCInstBuilder(X86::POP32r).addReg(MI->getOperand(0).getReg()), false);
 
     if (HasActiveDwarfFrame && !hasFP) {
       OutStreamer->emitCFIAdjustCfaOffset(stackGrowth);
@@ -2671,7 +2712,7 @@ void X86AsmPrinter::emitInstruction(const MachineInstr *MI) {
     EmitAndAlignInstruction(MCInstBuilder(X86::ADD32ri)
                                 .addReg(MI->getOperand(0).getReg())
                                 .addReg(MI->getOperand(1).getReg())
-                                .addExpr(DotExpr));
+                                .addExpr(DotExpr), false);
     return;
   }
   case TargetOpcode::STATEPOINT:
@@ -2708,14 +2749,14 @@ void X86AsmPrinter::emitInstruction(const MachineInstr *MI) {
     return LowerPATCHABLE_TYPED_EVENT_CALL(*MI, MCInstLowering);
 
   case X86::MORESTACK_RET:
-    EmitAndAlignInstruction(MCInstBuilder(getRetOpcode(*Subtarget)));
+    EmitAndAlignInstruction(MCInstBuilder(getRetOpcode(*Subtarget)), false);
     return;
 
   case X86::MORESTACK_RET_RESTORE_R10:
     // Return, then restore R10.
-    EmitAndAlignInstruction(MCInstBuilder(getRetOpcode(*Subtarget)));
+    EmitAndAlignInstruction(MCInstBuilder(getRetOpcode(*Subtarget)), false);
     EmitAndAlignInstruction(
-        MCInstBuilder(X86::MOV64rr).addReg(X86::R10).addReg(X86::RAX));
+        MCInstBuilder(X86::MOV64rr).addReg(X86::R10).addReg(X86::RAX), false);
     return;
 
   case X86::SEH_PushReg:
@@ -2740,7 +2781,7 @@ void X86AsmPrinter::emitInstruction(const MachineInstr *MI) {
       // looking for a call. We may emit an unnecessary nop in some cases.
       if (!MBBI->isPseudo()) {
         if (MBBI->isCall())
-          EmitAndAlignInstruction(MCInstBuilder(X86::NOOP));
+          EmitAndAlignInstruction(MCInstBuilder(X86::NOOP), false);
         break;
       }
     }
@@ -2775,5 +2816,5 @@ void X86AsmPrinter::emitInstruction(const MachineInstr *MI) {
       TmpInst.setOpcode(X86::JMP_4);
   }
 
-  EmitAndAlignInstruction(TmpInst);
+  EmitAndAlignInstruction(TmpInst, MI->getDesc().isCall());
 }
