@@ -130,6 +130,8 @@ void X86AsmPrinter::EmitAndAlignInstruction(MCInst &Inst, bool isCall) {
     return;
   }*/
 
+  bool isUCF = MF->getName().startswith("__unsan_ucf_");
+
   // Avoid 8-bit PC-Relative jump
   if (Inst.getOpcode() == X86::JMP_1)
     Inst.setOpcode(X86::JMP_4);
@@ -150,29 +152,33 @@ void X86AsmPrinter::EmitAndAlignInstruction(MCInst &Inst, bool isCall) {
   // If current unit is reaching the alignment unit, we will enforce the current 
   // instruction to be aligned in the next unit
   if (IC.getCodeSize() > (SFIDEPAlignmentUnit - jmpInstBytes)) {
-    /*
-    // emit jmp
-    Twine tmp = MF->getName() + "." + Twine(units++);
-    MCSymbol *Sym = OutContext.getOrCreateSymbol(tmp);
+    MCSymbol *Sym = NULL;
+    if (isUCF) {
+      // emit jmp
+      Twine tmp = MF->getName() + "." + Twine(units++);
+      Sym = OutContext.getOrCreateSymbol(tmp);
+      
+      // Jaebaek: We don't need to add another uncondBr at the 32-bytes boundary.
+      if (isUncondBranch)
+        EmitAndCountInstruction(Inst);
+      else
+        EmitAndCountInstruction(MCInstBuilder(X86::JMP_4)
+            .addExpr(MCSymbolRefExpr::create(Sym,
+                MCSymbolRefExpr::VK_None, OutContext)));
+    }
 
-    // Jaebaek: We don't need to add another uncondBr at the 32-bytes boundary.
-    if (isUncondBranch)
-      EmitAndCountInstruction(Inst);
-    else
-      EmitAndCountInstruction(MCInstBuilder(X86::JMP_4)
-          .addExpr(MCSymbolRefExpr::create(Sym,
-              MCSymbolRefExpr::VK_None, OutContext)));
-    */
-
-    // We do not emit jump because we don't need ASLR. We just make sure that everything
+    // We do not emit jump because we don't need ASLR unless in UCF. We just make sure that everything
     // is aligned
     // emit align
     OutStreamer->emitCodeAlignment(SFIDEPAlignmentUnit);
 
-    /*
-    // emit label
-    OutStreamer->EmitLabel(Sym);
-    */
+    if (isUCF) {
+      // emit ud2
+      EmitAndCountInstruction(MCInstBuilder(X86::TRAP));
+
+      // emit label
+      OutStreamer->emitLabel(Sym);
+    }
 
     // Jaebaek: We don't need to add another uncondBr at the 32-bytes boundary.
     //if (isUncondBranch)
@@ -181,7 +187,13 @@ void X86AsmPrinter::EmitAndAlignInstruction(MCInst &Inst, bool isCall) {
 
     // The next unit
     IC.putBackTotalCodeSize(isz);
-    IC.setCodeSize(isz);
+    if (isUCF) {
+      // 2 is UD2
+      IC.setCodeSize(isz + 2);
+    }
+    else {
+      IC.setCodeSize(isz);
+    }
     EmitAndCountInstruction(Inst);
 
     //}
@@ -2486,8 +2498,7 @@ void X86AsmPrinter::emitInstruction(const MachineInstr *MI) {
    */
   if (!MF->hasInlineAsm()) {
     if (MI->isIndirectBranch(MachineInstr::IgnoreBundle) && !MI->getIterator()->isInsideBundle()) {
-	
-	printf("INDIRECT BRANCH that is not sanitized!\n");
+	      printf("INDIRECT BRANCH that is not sanitized!\n");
         printf("Offset in current block %llx\n", IC.getTotalCodeSize());
     }
     isUncondBranch = (MI->isReturn() || MI->isUnconditionalBranch() || MI->isIndirectBranch());
@@ -2500,10 +2511,10 @@ void X86AsmPrinter::emitInstruction(const MachineInstr *MI) {
       while (++I != E && I->isInsideBundle()) {
         const MachineInstr &tmpI = *I;
         emitInstruction(&tmpI);
-	if (I->getOpcode() == X86::JMP64r || I->getOpcode() == X86::CALL64r ||
-			I->getOpcode() == X86::TAILJMPr64) {
-	  isBranchInBundle = true;
-	}
+	      if (I->getOpcode() == X86::JMP64r || I->getOpcode() == X86::CALL64r ||
+	      		I->getOpcode() == X86::TAILJMPr64) {
+	        isBranchInBundle = true;
+	      }
       }
 
       // Instr before the bundle and the bundle exceeds (32 - 5) bytes
@@ -2550,8 +2561,8 @@ void X86AsmPrinter::emitInstruction(const MachineInstr *MI) {
 
       if (isBranchInBundle) {
         // Align
-	OutStreamer->emitCodeAlignment(SFIDEPAlignmentUnit);
-	IC.setCodeSize(bundleSize);
+	      OutStreamer->emitCodeAlignment(SFIDEPAlignmentUnit);
+	      IC.setCodeSize(bundleSize);
       }
 
       bundledInst.clear();

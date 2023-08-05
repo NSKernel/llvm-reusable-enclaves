@@ -83,6 +83,18 @@ bool X86SFIDEP::runOnMachineFunction(MachineFunction &MF) {
 	if (MF.getName().startswith("__unsan_")) {
 		//	(strncmp(MF.getName(), "__unsan_", 8))) {
 		// Allow unsanitized functions
+		/*
+		if (MF.getName().startswith("__unsan_ucf_")) {
+			// Critical functions. Add a ud2
+			MachineFunction::iterator i = MF.begin();
+			MachineBasicBlock &MBB = *i;
+			MachineBasicBlock::iterator MBBi = MBB.begin();
+			MachineInstr &MI = *MBBi;
+			DebugLoc DL = MI.getDebugLoc();
+			BuildMI(MBB, MBBi, DL, instrInfo->get(X86::TRAP));
+			return true;
+		}
+		*/
 		return false;
 	}
 
@@ -94,6 +106,7 @@ bool X86SFIDEP::runOnMachineFunction(MachineFunction &MF) {
 		DebugLoc DL = MI.getDebugLoc();
 		
 		BuildMI(*MBB, MBBI, DL, instrInfo->get(X86::MOV64ri), X86::R15).addImm(0);
+		modified = true;
 	}
 
 	for (MachineFunction::iterator i = MF.begin(), end = MF.end(); i != end; ++i) {
