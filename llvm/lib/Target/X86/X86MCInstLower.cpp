@@ -130,8 +130,6 @@ void X86AsmPrinter::EmitAndAlignInstruction(MCInst &Inst, bool isCall) {
     return;
   }*/
 
-  bool isUCF = MF->getName().startswith("__unsan_ucf_");
-
   // Avoid 8-bit PC-Relative jump
   if (Inst.getOpcode() == X86::JMP_1)
     Inst.setOpcode(X86::JMP_4);
@@ -207,7 +205,7 @@ void X86AsmPrinter::EmitAndAlignInstruction(MCInst &Inst, bool isCall) {
   // If it is CALLx, the next instruction is not regarded
   // as a new basic block. In such situation, we will have
   // to emit alignment by ourselves
-  if (isCall) {
+  if (isCall && (!isUCF)) {
     OutStreamer->emitCodeAlignment(SFIDEPAlignmentUnit);
     IC.setCodeSize(0);
   }
@@ -218,8 +216,10 @@ void X86AsmPrinter::EmitAndAlignInstruction(MCInst &Inst, bool isCall) {
       Inst.getOpcode() == X86::JMP_2  || Inst.getOpcode() == X86::JMP_4) {
     // For some cases like switch-case, JMP does not generate
     // a new basic block
-    OutStreamer->emitCodeAlignment(SFIDEPAlignmentUnit);
-    IC.setCodeSize(0);
+    if ((!isUCF)) {
+      OutStreamer->emitCodeAlignment(SFIDEPAlignmentUnit);
+      IC.setCodeSize(0);
+    }
   }
 }
 

@@ -103,6 +103,7 @@ class LLVM_LIBRARY_VISIBILITY X86AsmPrinter : public AsmPrinter {
   InstCounter IC;
   unsigned units;
   bool isUncondBranch;
+  bool isUCF;
 
 
   StackMapShadowTracker SMShadowTracker;

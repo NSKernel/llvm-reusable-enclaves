@@ -61,6 +61,7 @@ bool X86AsmPrinter::runOnMachineFunction(MachineFunction &MF) {
 
   IC.setForNewFunction(MF);
   units = 0;
+  isUCF = MF.getName().startswith("__unsan_ucf_");
 
   SMShadowTracker.startFunction(MF);
   CodeEmitter.reset(TM.getTarget().createMCCodeEmitter(

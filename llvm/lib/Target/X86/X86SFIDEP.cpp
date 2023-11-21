@@ -273,6 +273,42 @@ bool X86SFIDEP::alignBranch(MachineBasicBlock &MBB, MachineBasicBlock::iterator 
 		finalizeBundle(MBB, ANDi.getInstrIterator());
 		return true;
 	}
+	else if (Opcode == X86::JMP64m ||
+	         Opcode == X86::CALL64m ||
+	         Opcode == X86::TAILJMPm64) {
+		// We must ensure that all targets are aligned to 32 bytes
+		MachineOperand &BaseReg  = MI.getOperand(0);
+		MachineOperand &Scale = MI.getOperand(1);
+		MachineOperand &IndexReg  = MI.getOperand(2);
+		MachineOperand &Disp = MI.getOperand(3);
+		MachineOperand &SegmentReg = MI.getOperand(4);
+
+		MachineInstr *movMi = BuildMI(MBB, MBBi, DL, instrInfo->get(X86::MOV64rm)).addReg(X86::R14).addReg(BaseReg.getReg()).add(Scale).addReg(IndexReg.getReg()).add(Disp).addReg(0);
+		
+		MachineInstr *andMi = BuildMI(MBB, MBBi, DL, instrInfo->get(X86::AND64ri8), X86::R14).addReg(X86::R14).addImm(-32);
+		unsigned int newOpcode;
+
+		if (Opcode == X86::JMP64m) {
+			newOpcode = X86::JMP64r;
+		}
+		else if (Opcode == X86::CALL64m) {
+			newOpcode = X86::CALL64r;
+		}
+		else if (Opcode == X86::TAILJMPm64) {
+			newOpcode = X86::TAILJMPr64;
+		}
+		MachineInstr *callMi = BuildMI(MBB, MBBi, DL, instrInfo->get(newOpcode), X86::R14);
+		MachineBasicBlock::iterator MOVi = movMi;
+		MachineBasicBlock::iterator CALLi = callMi;
+
+		lastBundlePointer = MOVi;
+
+		// Make our injected code plus the original branch instruction as a bundle
+		MI.eraseFromParent();
+		MIBundleBuilder(MBB, MOVi, ++CALLi);
+		finalizeBundle(MBB, MOVi.getInstrIterator());
+		return true;
+	}
 
 	return false;
 }
